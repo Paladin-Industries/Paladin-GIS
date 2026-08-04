@@ -1,0 +1,46 @@
+name: Release
+
+# Tag a version to publish it:  git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches metadata.txt
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          META="$(grep -E '^version=' paladin_gis/metadata.txt | cut -d= -f2 | tr -d '[:space:]')"
+          if [ "$TAG" != "$META" ]; then
+            echo "Tag $TAG does not match metadata.txt version $META" >&2
+            exit 1
+          fi
+
+      - name: Syntax check
+        run: python -m compileall -q paladin_gis
+
+      - name: Guard against committed credentials
+        run: |
+          if grep -rnE 'AKIA[0-9A-Z]{16}' --include='*.py' paladin_gis \
+               | grep -v 'AKIAIOSFODNN7EXAMPLE'; then
+            echo "Possible AWS key in source" >&2; exit 1
+          fi
+          if grep -rnE '^DEFAULT_(ACCESS|SECRET)_KEY *= *"..' paladin_gis/config.py; then
+            echo "Non-empty credential default in config.py" >&2; exit 1
+          fi
+
+      - name: Build zip
+        run: ./scripts/build_zip.sh
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true

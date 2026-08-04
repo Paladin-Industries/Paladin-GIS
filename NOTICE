@@ -1,0 +1,29 @@
+Paladin GIS
+Copyright (C) 2026 Paladin Industries, Inc.
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 2 of the License, or (at your option) any later
+version. See LICENSE for the full text.
+
+TRADEMARKS
+----------
+"Paladin", "Paladin Industries", and the Paladin logo are trademarks of
+Paladin Industries, Inc. The GPL grants rights to this software; it does not
+grant any right to use these marks. Redistributions and derivative works must
+not use the Paladin name or marks in a way that suggests endorsement by or
+affiliation with Paladin Industries.
+
+SERVICE ACCESS
+--------------
+This software is a client. Reading and writing tactic data requires
+credentials issued by Paladin Industries under an active subscription. The
+license above covers the code only; use of the Paladin service is governed by
+your subscription agreement.
+
+NO WARRANTY FOR OPERATIONAL USE
+-------------------------------
+As stated in sections 11 and 12 of the GPL, this software is provided without
+warranty of any kind. Outputs are decision support, not direction. Nothing in
+this repository alters the terms of any separate agreement with Paladin
+Industries.

@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Build output
+dist/
+*.zip
+
+# QGIS / GDAL sidecars
+*.qgs~
+*.aux.xml
+*.gpkg-shm
+*.gpkg-wal
+
+# Local credentials — never commit
+.env
+*.pem
+credentials.json
+settings.local.json
+
+# OS
+.DS_Store
+Thumbs.db
