@@ -93,4 +93,17 @@ DEFAULT_ACCESS_KEY = ""
 DEFAULT_SECRET_KEY = ""
 DEFAULT_SESSION_TOKEN = ""
 DEFAULT_DISTURBANCE_PREFIX = "disturbances"
+ORG_PREFIX_SEGMENT = "orgs"
+
+
+def disturbance_prefix_for(org_id, fallback=None):
+    """S3 key prefix for an organization's tactics.
+
+    Must match the QGIS plugin's config.disturbance_prefix_for() exactly, or a
+    Pro user and a QGIS user in the same org would write to different paths.
+    """
+    org = (org_id or "").strip().strip("/")
+    if not org:
+        return (fallback or DEFAULT_DISTURBANCE_PREFIX).strip("/")
+    return "%s/%s/%s" % (DEFAULT_DISTURBANCE_PREFIX, ORG_PREFIX_SEGMENT, org)
 DEFAULT_ORG_ID = ""

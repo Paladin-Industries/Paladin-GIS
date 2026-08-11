@@ -45,7 +45,8 @@ def push(gdb, settings, state, log):
             "your Paladin account email.")
 
     backend = make_backend(settings)
-    prefix = (settings.get("disturbance_prefix") or "").strip("/")
+    prefix = schema.disturbance_prefix_for(
+        settings.get("org_id"), settings.get("disturbance_prefix"))
     now = store.utc_now_iso()
 
     uploads = 0
@@ -92,7 +93,8 @@ def push(gdb, settings, state, log):
 def pull(gdb, settings, state, log):
     """Read down current versions, visibility-filter, reconcile. Returns counts."""
     backend = make_backend(settings)
-    prefix = (settings.get("disturbance_prefix") or "").strip("/")
+    prefix = schema.disturbance_prefix_for(
+        settings.get("org_id"), settings.get("disturbance_prefix"))
     list_prefix = (prefix + "/") if prefix else ""
     my_org = settings.get("org_id", "")
     my_author = settings.get("author", "")

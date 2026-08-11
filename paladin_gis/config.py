@@ -163,6 +163,27 @@ DEFAULT_PALADIN_API_BASE = "https://api.paladin.example"
 #   key: {DISTURBANCE_PREFIX}/{tactic_id}.geojson
 DEFAULT_DISTURBANCE_PREFIX = "disturbances"
 
+#: Tactics are stored per organization:
+#:     {DEFAULT_DISTURBANCE_PREFIX}/orgs/{org_id}/{tactic_id}/...
+#: The prefix is DERIVED from the org id rather than configured separately, so
+#: there is one less setting to get wrong — credentials are scoped to an org's
+#: own prefix, and the shared default would 403 on first sync.
+#: `disturbances/public/` is reserved for cross-org public tactics (not yet
+#: written by this client).
+ORG_PREFIX_SEGMENT = "orgs"
+
+
+def disturbance_prefix_for(org_id, fallback=None):
+    """S3 key prefix for an organization's tactics.
+
+    Falls back to the stored/default prefix when no org id is set, which keeps
+    single-tenant and local test setups working.
+    """
+    org = (org_id or "").strip().strip("/")
+    if not org:
+        return (fallback or DEFAULT_DISTURBANCE_PREFIX).strip("/")
+    return "%s/%s/%s" % (DEFAULT_DISTURBANCE_PREFIX, ORG_PREFIX_SEGMENT, org)
+
 # Identity defaults (set per user in Settings).
 DEFAULT_ORG_ID = ""
 

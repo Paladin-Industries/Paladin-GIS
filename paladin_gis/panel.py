@@ -554,7 +554,11 @@ class PaladinDock(QDockWidget):
         # Build immutable version objects. Never overwrite: create -> v1,
         # edit -> v+1 (supersedes prev), delete -> v+1 status=inactive.
         # Key: {prefix}/{tactic_id}/{version:06d}-{version_id}.geojson
-        prefix = s["disturbance_prefix"].strip("/")
+        # Derived from the org id so a customer only enters identity, not a
+        # storage path. Credentials are scoped to this prefix, so a mismatch
+        # here is what produces a 403 on PUT.
+        prefix = config.disturbance_prefix_for(
+            s.get("org_id"), s.get("disturbance_prefix"))
         now = tactics.utc_now_iso()
         uploads = []
         self._pending_removals = []   # tombstoned lineages to drop after success
@@ -660,7 +664,8 @@ class PaladinDock(QDockWidget):
             lay.addWidget(widget, i, 1)
 
         hint = QLabel("Author = you (individual, for private tactics). Org id = "
-                      "your organization (controls 'org' visibility). Paste the "
+                      "your organization (controls 'org' visibility AND where "
+                      "your tactics are stored). Paste the "
                       "two AWS keys you were emailed.")
         hint.setWordWrap(True)
         lay.addWidget(hint, len(rows), 0, 1, 2)

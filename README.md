@@ -154,6 +154,17 @@ Visibility is set per tactic: `public`, `org`, or `private`.
 
 ---
 
+## Storage layout
+
+Tactics are stored per organization, derived from the Org ID you enter in
+settings:
+
+    disturbances/orgs/<org_id>/<tactic_id>/<version>-<version_id>.geojson
+
+There is no separate prefix to configure. Your credentials are scoped to that
+path, so an incorrect Org ID surfaces as an S3 403 on the first sync rather
+than as silently missing data.
+
 ## Getting access
 
 Email **<sales@paladinindustries.com>** with your organization and the email
