@@ -165,8 +165,9 @@ def add_disturbance_layer(name, geojson_obj):
     from qgis.core import QgsField, QgsFields
     from qgis.PyQt.QtCore import QMetaType
     fields = QgsFields()
-    for fname, _ in config.TACTIC_FIELDS:
-        fields.append(QgsField(fname, QMetaType.Type.QString))
+    for fname, ftype in config.TACTIC_FIELDS:
+        fields.append(QgsField(
+            fname, tactics._FIELD_TYPE.get(ftype, QMetaType.Type.QString)))
     layer.dataProvider().addAttributes(fields.toList())
     layer.updateFields()
 

@@ -48,6 +48,35 @@ _AREA_LAYER_NAME = "Paladin Tactics (Areas)"
 _LINE_LAYER_NAME = "Paladin Tactics (Lines)"
 
 _FIELD_TYPE = {"String": QMetaType.Type.QString, "Int": QMetaType.Type.Int, "Double": QMetaType.Type.Double}
+_FIELD_TYPE_BY_NAME = dict(config.TACTIC_FIELDS)
+
+
+def _coerce_prop(name, raw):
+    """Coerce a (stringified) GeoJSON property to its memory-layer field type.
+
+    Payload properties are all strings on the wire; numeric fields such as
+    `line_width_m` must come back as numbers so the memory layer, the content
+    hash, and re-serialization stay consistent. Empty -> NULL for numerics,
+    "" for strings (matching the prior stringify behavior).
+    """
+    ftype = _FIELD_TYPE_BY_NAME.get(name, "String")
+    if ftype == "Double":
+        s = "" if raw is None else str(raw).strip().replace(",", ".")
+        if not s:
+            return None
+        try:
+            return float(s)
+        except ValueError:
+            return None
+    if ftype == "Int":
+        s = "" if raw is None else str(raw).strip()
+        if not s:
+            return None
+        try:
+            return int(float(s))
+        except ValueError:
+            return None
+    return "" if raw is None else str(raw)
 
 
 def _log(msg, level=Qgis.MessageLevel.Info):
@@ -68,7 +97,8 @@ def content_hash(feature):
     geom = feature.geometry()
     parts = [geom.asWkt(7) if geom and not geom.isEmpty() else ""]
     for name in ("tactic_type", "notes", "effective_from_utc",
-                 "effective_to_utc", "org_id", "visibility", "simulate"):
+                 "effective_to_utc", "org_id", "visibility", "simulate",
+                 "line_width_m"):
         val = feature[name]
         parts.append("" if val is None else str(val))
     return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
@@ -137,8 +167,14 @@ class TacticStore:
     def add_tactic(self, tactic_type, geometry, source_crs, *,
                    notes="", effective_from=None, effective_to=None,
                    org_id="", author="", visibility=None, simulate=True,
-                   source="drawn", source_file=""):
+                   source="drawn", source_file="", geometry_mode=None,
+                   line_width_m=None):
         """Add one tactic. `geometry` is a QgsGeometry in `source_crs`.
+
+        `geometry_mode` ("area" | "line") overrides the tactic type's default
+        `category`; when None, the type's default is used (back-compat). For a
+        line feature, `line_width_m` records the real-world footprint width in
+        metres (recorded only, not applied to the geometry here).
 
         Returns the tactic_id, or None on failure.
         """
@@ -152,7 +188,16 @@ class TacticStore:
             _log("Tactic geometry empty after reprojection", Qgis.MessageLevel.Warning)
             return None
 
-        geom_kind = "area" if spec["category"] == "area" else "line"
+        geom_kind = geometry_mode if geometry_mode in ("area", "line") \
+            else ("area" if spec["category"] == "area" else "line")
+        # Width is meaningful only for line features. Ignore it for polygons so a
+        # stray value can't ride along and confuse the consumer.
+        width_val = None
+        if geom_kind == "line" and line_width_m not in (None, ""):
+            try:
+                width_val = float(line_width_m)
+            except (TypeError, ValueError):
+                width_val = None
         # Normalize to Multi* so single- and multi-part inputs share a layer.
         geom_4326.convertToMultiType()
 
@@ -180,6 +225,7 @@ class TacticStore:
             "simulate": "true" if simulate else "false",
             "source": source,
             "source_file": source_file or "",
+            "line_width_m": width_val,   # None (NULL) for polygons
         }
         for name, val in values.items():
             feat.setAttribute(name, val)
@@ -318,7 +364,7 @@ class TacticStore:
         feat = QgsFeature(layer.fields())
         feat.setGeometry(geom)
         for name, _t in config.TACTIC_FIELDS:
-            feat.setAttribute(name, str(props.get(name, "") or ""))
+            feat.setAttribute(name, _coerce_prop(name, props.get(name)))
         layer.dataProvider().addFeatures([feat])
         layer.updateExtents()
         layer.triggerRepaint()
@@ -331,7 +377,7 @@ class TacticStore:
         layer.dataProvider().changeGeometryValues({feat.id(): geom})
         idx = {n: layer.fields().indexFromName(n) for n, _t in config.TACTIC_FIELDS}
         layer.dataProvider().changeAttributeValues(
-            {feat.id(): {idx[n]: str(props.get(n, "") or "")
+            {feat.id(): {idx[n]: _coerce_prop(n, props.get(n))
                          for n, _t in config.TACTIC_FIELDS}})
         layer.triggerRepaint()
         return True
@@ -405,7 +451,7 @@ def geojson_to_features(geojson_obj, layer_fields):
         props = gj.get("properties", {}) or {}
         for name, _ in config.TACTIC_FIELDS:
             if name in props:
-                feat.setAttribute(name, str(props[name]))
+                feat.setAttribute(name, _coerce_prop(name, props[name]))
         feats.append(feat)
     return feats
 
@@ -489,10 +535,11 @@ def _apply_style(layer, tactic_type):
 
     is_area = layer.geometryType() == Qgis.GeometryType.Polygon
     categories = []
+    # A tactic type may now appear in EITHER layer (a fuel break drawn as a
+    # line, a dozer line drawn as a polygon), so we style every type in both
+    # layers rather than filtering by the type's default `category`. The symbol
+    # geometry follows the layer, so the styling stays correct either way.
     for key, spec in config.TACTIC_TYPES.items():
-        want_area = spec["category"] == "area"
-        if want_area != is_area:
-            continue
         sym = QgsSymbol.defaultSymbol(layer.geometryType())
         r, g, b, a = spec["color"]
         if is_area:

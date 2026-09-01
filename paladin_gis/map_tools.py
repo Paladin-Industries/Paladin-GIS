@@ -48,6 +48,7 @@ class TacticCaptureTool(QgsMapTool):
         self._canvas = canvas
         self._tactic_type = None
         self._is_area = True
+        self._color = QColor(255, 176, 0, 200)   # default until set_tactic arms it
         self._freehand = False
 
         self._points = []            # committed vertices (QgsPointXY, map CRS)
@@ -58,13 +59,26 @@ class TacticCaptureTool(QgsMapTool):
         self._temp_band = None       # moving-segment preview band
 
     # -- configuration ------------------------------------------------------ #
-    def set_tactic(self, tactic_type):
+    def set_tactic(self, tactic_type, is_area=None):
+        """Arm the tool for `tactic_type`.
+
+        `is_area` overrides the type's default `category` for this draw: pass
+        True to capture a polygon, False to capture a line. When None, the
+        type's default is used. Re-arm the tool whenever the Geometry toggle
+        changes so the rubber band and finish rules match what will be stored.
+        """
         spec = config.TACTIC_TYPES.get(tactic_type)
         if spec is None:
             return
         self._tactic_type = tactic_type
-        self._is_area = spec["category"] == "area"
+        if is_area is None:
+            self._is_area = spec["category"] == "area"
+        else:
+            self._is_area = bool(is_area)
         self._color = QColor(*spec["color"])
+        # A partially-drawn shape can't switch geometry type mid-stream; reset.
+        self._clear()
+        self._reset_bands()
 
     def set_freehand(self, enabled):
         self._freehand = bool(enabled)

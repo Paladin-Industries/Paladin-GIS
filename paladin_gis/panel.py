@@ -204,6 +204,7 @@ class PaladinDock(QDockWidget):
         self._canvas = iface.mapCanvas()
         self._store = store
         self._capture_tool = None
+        self._current_type = None
         self._worker = None
         self._editing_lineage = None
         self._editing_layer = None
@@ -298,6 +299,24 @@ class PaladinDock(QDockWidget):
             spec["_button"] = btn  # keep a handle to un-check siblings
         lay.addLayout(grid)
 
+        # Geometry mode + width. The toggle snaps to the picked type's default
+        # category but can be overridden per draw; width applies to Line only.
+        geom_row = QHBoxLayout()
+        geom_row.addWidget(QLabel("Geometry:"))
+        self._geom_mode = QComboBox()
+        for label, mode in config.GEOMETRY_MODES:
+            self._geom_mode.addItem(label, mode)
+        self._geom_mode.currentIndexChanged.connect(self._on_geom_mode_changed)
+        geom_row.addWidget(self._geom_mode)
+        geom_row.addWidget(QLabel("Width (m):"))
+        self._line_width = QLineEdit()
+        self._line_width.setPlaceholderText("e.g. 3.0")
+        self._line_width.setMaximumWidth(80)
+        geom_row.addWidget(self._line_width)
+        geom_row.addStretch(1)
+        lay.addLayout(geom_row)
+        self._sync_width_enabled()
+
         lay.addWidget(QLabel("Notes"))
         self._notes = QLineEdit()
         lay.addWidget(self._notes)
@@ -323,8 +342,9 @@ class PaladinDock(QDockWidget):
         class_row.addWidget(self._simulate)
         lay.addLayout(class_row)
 
-        hint = QLabel("Left-click vertices, right-click / double-click to finish, "
-                      "Backspace to undo, Esc to cancel.")
+        hint = QLabel("Pick a tactic, then Polygon or Line. Line records a "
+                      "footprint width (m). Left-click vertices, right-click / "
+                      "double-click to finish, Backspace to undo, Esc to cancel.")
         hint.setWordWrap(True)
         lay.addWidget(hint)
         return box
@@ -341,13 +361,51 @@ class PaladinDock(QDockWidget):
             btn = spec.get("_button")
             if btn is not None:
                 btn.setChecked(key == tactic_type)
-        self._capture_tool.set_tactic(tactic_type)
+        self._current_type = tactic_type
+        # Snap the Geometry toggle to this type's default category (user may then
+        # override it). Block signals so this doesn't fire _on_geom_mode_changed
+        # before the tool is armed below.
+        default_mode = config.TACTIC_TYPES[tactic_type]["category"]
+        self._geom_mode.blockSignals(True)
+        idx = self._geom_mode.findData(default_mode)
+        if idx >= 0:
+            self._geom_mode.setCurrentIndex(idx)
+        self._geom_mode.blockSignals(False)
+        self._sync_width_enabled()
+
+        is_area = self._geom_mode.currentData() == "area"
+        self._capture_tool.set_tactic(tactic_type, is_area=is_area)
         self._capture_tool.set_freehand(self._freehand.isChecked())
         self._canvas.setMapTool(self._capture_tool)
+
+    def _on_geom_mode_changed(self, _idx):
+        """Re-arm the active capture tool when the Geometry toggle changes."""
+        self._sync_width_enabled()
+        if self._capture_tool is None or getattr(self, "_current_type", None) is None:
+            return
+        is_area = self._geom_mode.currentData() == "area"
+        self._capture_tool.set_tactic(self._current_type, is_area=is_area)
+        self._capture_tool.set_freehand(self._freehand.isChecked())
+
+    def _sync_width_enabled(self):
+        """Enable the width field only in Line mode; pre-fill a default width."""
+        is_line = self._geom_mode.currentData() == "line"
+        self._line_width.setEnabled(is_line)
+        if is_line and not self._line_width.text().strip():
+            self._line_width.setText(str(config.DEFAULT_LINE_WIDTH_M))
 
     def _on_captured(self, geometry, tactic_type):
         s = load_settings()
         src_crs = self._canvas.mapSettings().destinationCrs()
+        mode = self._geom_mode.currentData()
+        width = None
+        if mode == "line":
+            width = self._parse_width()
+            if width is None:
+                self._iface.messageBar().pushWarning(
+                    "Paladin", "Enter a positive line width (m) before drawing "
+                    "a line tactic.")
+                return
         tid = self._store.add_tactic(
             tactic_type, geometry, src_crs,
             notes=self._notes.text().strip(),
@@ -358,11 +416,26 @@ class PaladinDock(QDockWidget):
             visibility=self._visibility.currentData(),
             simulate=self._simulate.isChecked(),
             source="drawn",
+            geometry_mode=mode,
+            line_width_m=width,
         )
         if tid:
+            suffix = (" (%.3g m wide)" % width) if width is not None else ""
             self._iface.messageBar().pushInfo(
-                "Paladin", "Added %s" % config.TACTIC_TYPES[tactic_type]["label"])
+                "Paladin", "Added %s%s"
+                % (config.TACTIC_TYPES[tactic_type]["label"], suffix))
             self.refresh_list()
+
+    def _parse_width(self):
+        """Return a positive float width in metres, or None if invalid/blank."""
+        raw = self._line_width.text().strip().replace(",", ".")
+        if not raw:
+            return None
+        try:
+            val = float(raw)
+        except ValueError:
+            return None
+        return val if val > 0 else None
 
     # ---- Import ------------------------------------------------------------ #
     def _build_import_group(self):
@@ -477,7 +550,9 @@ class PaladinDock(QDockWidget):
                 ver = "unsynced"
             else:
                 ver = "v%d" % state["version"]
-            text = "%s  |  %s / %s  |  %s" % (label, vis, sim, ver)
+            width = feat["line_width_m"]
+            geom = "line %.3gm" % width if width not in (None, "") else "polygon"
+            text = "%s  |  %s  |  %s / %s  |  %s" % (label, geom, vis, sim, ver)
             item = QListWidgetItem(text)
             item.setData(Qt.ItemDataRole.UserRole, feat["tactic_id"])
             self._list.addItem(item)
@@ -554,11 +629,7 @@ class PaladinDock(QDockWidget):
         # Build immutable version objects. Never overwrite: create -> v1,
         # edit -> v+1 (supersedes prev), delete -> v+1 status=inactive.
         # Key: {prefix}/{tactic_id}/{version:06d}-{version_id}.geojson
-        # Derived from the org id so a customer only enters identity, not a
-        # storage path. Credentials are scoped to this prefix, so a mismatch
-        # here is what produces a 403 on PUT.
-        prefix = config.disturbance_prefix_for(
-            s.get("org_id"), s.get("disturbance_prefix"))
+        prefix = s["disturbance_prefix"].strip("/")
         now = tactics.utc_now_iso()
         uploads = []
         self._pending_removals = []   # tombstoned lineages to drop after success
@@ -664,8 +735,7 @@ class PaladinDock(QDockWidget):
             lay.addWidget(widget, i, 1)
 
         hint = QLabel("Author = you (individual, for private tactics). Org id = "
-                      "your organization (controls 'org' visibility AND where "
-                      "your tactics are stored). Paste the "
+                      "your organization (controls 'org' visibility). Paste the "
                       "two AWS keys you were emailed.")
         hint.setWordWrap(True)
         lay.addWidget(hint, len(rows), 0, 1, 2)
