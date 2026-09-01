@@ -24,10 +24,11 @@ library, so there is nothing to pip-install.
 1. **LANDFIRE image services** — the catalog is LANDFIRE LF2025 CONUS fuels
    (surface + canopy). Double-click a dataset (or select + *Add selected
    layer*) to load it as a raster under a `LANDFIRE` group.
-2. **Draw tactic** — pick Fuel Break / Rx Burn / Scratch / Handline / Dozer.
-   Left-click vertices, right-click or double-click to finish. Tick *Freehand*
-   to press-drag-release ("free polygon"). Notes + effective-time window are
-   attached as metadata.
+2. **Draw tactic** — pick Fuel Break / Rx Burn / Scratch / Handline / Dozer /
+   Hose Lay / Retardant, then choose **Polygon** or **Line** (Line records a
+   footprint width in metres). Left-click vertices, right-click or double-click
+   to finish. Tick *Freehand* to press-drag-release ("free polygon"). Notes +
+   effective-time window are attached as metadata.
 3. **Import file** — bring in GeoJSON/KML/KMZ, tagging what it represents.
 4. **Tactics** — running list of your tactics AND everything synced down from
    S3 that you're allowed to see. Buttons: **Edit** (hands the selected tactic
@@ -48,7 +49,18 @@ version), `version` (int), `supersedes` (previous `version_id`), `status`
 Plus `tactic_type`, `model_role` (`control_line` | `fuel_modification`),
 `label`, `notes`, `effective_from_utc`, `effective_to_utc`, `org_id`,
 `visibility` (`public`|`org`|`private`), `simulate` (`"true"`|`"false"`),
-`source`, `source_file`.
+`source`, `source_file`, `line_width_m`.
+
+`line_width_m` is the real-world **footprint width in metres** for a LINE
+feature (empty for polygons). Geometry kind is now chosen per feature at draw
+time (the **Geometry** toggle: Polygon or Line) and is independent of the
+tactic type — you can sketch a fuel break as a centerline + width instead of
+tracing both edges. `model_role` still follows the *type*, not the drawn
+geometry: a line's footprint is its centerline buffered by `line_width_m`, and
+**the sim consumer must do that buffering** — the plugin only records the width.
+The field is an additive, optional property, so `paladin_schema` stays
+`paladin.tactic.v3` and older consumers keep accepting payloads (they ignore
+it). Editing a line's width bumps a new version like any other change.
 
 Key layout (folder per lineage):
 - `{disturbance_prefix}/{tactic_id}/{version:06d}-{version_id}.geojson`

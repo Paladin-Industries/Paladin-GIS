@@ -26,6 +26,14 @@ from qgis.core import Qgis
 # Bump this string whenever the GeoJSON property contract changes. The fire
 # model reads `paladin_schema` first and refuses payloads it doesn't understand,
 # so this is the single source of truth for the wire format version.
+# DELIBERATELY NOT bumped for `line_width_m`. That field is an ADDITIVE,
+# optional property: existing consumers that key on "paladin.tactic.v3" keep
+# accepting payloads and simply ignore the new property, and a width-aware
+# consumer also accepts v3. Bumping to v4 would force a lockstep consumer deploy
+# (the model "refuses payloads it doesn't understand") for zero benefit here.
+# Bump only when you make a BREAKING change (rename/remove a field, or change a
+# field's meaning). If/when the consumer starts buffering lines by width, that's
+# still additive on the wire — no bump needed.
 TACTIC_SCHEMA = "paladin.tactic.v3"
 
 # CRS every payload is written in. Non-negotiable: the model expects lon/lat.
@@ -65,10 +73,21 @@ DEFAULT_SIMULATE = True
 # Tactic registry
 # --------------------------------------------------------------------------- #
 # `geometry`      -> Qgis.GeometryType used for capture + memory layer.
-# `category`      -> "area" | "line"  (used to route to the right memory layer)
+# `category`      -> "area" | "line". The DEFAULT geometry mode for this type.
+#                    As of schema v3 the drawer can override this per feature
+#                    (draw a fuel break as a centerline+width, a burn as a strip,
+#                    etc.); `category` just pre-selects the Geometry toggle.
 # `model_role`    -> how the fire model should treat this feature:
 #                      "fuel_modification" : area edits composed into the fuelbed
 #                      "control_line"      : candidate barrier / PCL line
+#                    NOTE: model_role stays tied to the TYPE, not to the drawn
+#                    geometry. A fuel break drawn as a line is still a
+#                    fuel_modification whose footprint width is `line_width_m`;
+#                    a dozer line is still a control_line whose barrier width is
+#                    `line_width_m`. Either way, a line feature's real-world
+#                    footprint is the centerline buffered by line_width_m. The
+#                    SIM CONSUMER must perform that buffering — the plugin only
+#                    records the width.
 # `color`         -> RGBA render + rubber-band color.
 #
 # This dict is the ONLY place to add a tactic type. The panel builds its
@@ -110,6 +129,20 @@ TACTIC_TYPES = {
         "model_role": "control_line",
         "color": (120, 90, 60, 230),     # brown
     },
+    "hose_lay": {
+        "label": "Hose Lay",
+        "geometry": Qgis.GeometryType.Line,
+        "category": "line",
+        "model_role": "control_line",
+        "color": (0, 150, 220, 220),     # water blue
+    },
+    "retardant": {
+        "label": "Retardant",
+        "geometry": Qgis.GeometryType.Polygon,
+        "category": "area",              # drop footprint; can be drawn as a line
+        "model_role": "fuel_modification",
+        "color": (233, 30, 99, 120),     # retardant pink/magenta
+    },
 }
 
 # Attribute schema for the in-canvas memory layers. Order matters: QgsFeature
@@ -133,7 +166,25 @@ TACTIC_FIELDS = [
     ("simulate", "String"),          # "true" | "false"
     ("source", "String"),            # "drawn" | "imported"
     ("source_file", "String"),
+    ("line_width_m", "Double"),      # footprint width (m) for LINE features;
+                                     # empty/NULL for polygon features
 ]
+
+# --------------------------------------------------------------------------- #
+# Geometry mode (per-feature override of a tactic type's default `category`)
+# --------------------------------------------------------------------------- #
+# The drawer picks one of these before capturing. When a tactic-type button is
+# pressed the toggle snaps to that type's `category`, but the user may override.
+#   "area" -> polygon capture, no width.
+#   "line" -> polyline capture, `line_width_m` recorded and shipped.
+GEOMETRY_MODES = [("Polygon", "area"), ("Line", "line")]
+
+# Default width (metres) pre-filled when the user switches a draw to Line mode.
+# Metres to match the physics model / SI convention. NOTE: fireline crews think
+# in feet (a D6 dozer line ~3.5-4 m, handline ~0.5-1 m); if you want the UI in
+# feet with an m conversion on write, that's a Settings toggle, not a schema
+# change. Left in metres for now.
+DEFAULT_LINE_WIDTH_M = 3.0
 
 # --------------------------------------------------------------------------- #
 # S3 / sync defaults (overridable in Settings)
@@ -162,27 +213,6 @@ DEFAULT_PALADIN_API_BASE = "https://api.paladin.example"
 # path — not by the key layout.
 #   key: {DISTURBANCE_PREFIX}/{tactic_id}.geojson
 DEFAULT_DISTURBANCE_PREFIX = "disturbances"
-
-#: Tactics are stored per organization:
-#:     {DEFAULT_DISTURBANCE_PREFIX}/orgs/{org_id}/{tactic_id}/...
-#: The prefix is DERIVED from the org id rather than configured separately, so
-#: there is one less setting to get wrong — credentials are scoped to an org's
-#: own prefix, and the shared default would 403 on first sync.
-#: `disturbances/public/` is reserved for cross-org public tactics (not yet
-#: written by this client).
-ORG_PREFIX_SEGMENT = "orgs"
-
-
-def disturbance_prefix_for(org_id, fallback=None):
-    """S3 key prefix for an organization's tactics.
-
-    Falls back to the stored/default prefix when no org id is set, which keeps
-    single-tenant and local test setups working.
-    """
-    org = (org_id or "").strip().strip("/")
-    if not org:
-        return (fallback or DEFAULT_DISTURBANCE_PREFIX).strip("/")
-    return "%s/%s/%s" % (DEFAULT_DISTURBANCE_PREFIX, ORG_PREFIX_SEGMENT, org)
 
 # Identity defaults (set per user in Settings).
 DEFAULT_ORG_ID = ""
