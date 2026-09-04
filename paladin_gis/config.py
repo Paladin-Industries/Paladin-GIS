@@ -61,8 +61,13 @@ STATUS_INACTIVE = "inactive"
 #     public  : any user of the platform
 #     org     : only users in the same org_id
 #     private : only the creator (author)
-VISIBILITY_LEVELS = ["public", "org", "private"]
-DEFAULT_VISIBILITY = "org"
+# Order matters: `private` is first so any UI that falls back to index 0 lands
+# on the most restrictive level, never `public`. DEFAULT_VISIBILITY is the
+# authoring default; it is deliberately the most restrictive, because customer
+# locations must not be shared by accident. Widening to org/public is an
+# explicit, per-tactic choice.
+VISIBILITY_LEVELS = ["private", "org", "public"]
+DEFAULT_VISIBILITY = "private"
 
 # simulate -> WHETHER the sim engine should include this tactic. Independent of
 #   visibility: a proposed tactic can be shared (public/org) but not simulated,
