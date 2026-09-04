@@ -83,6 +83,10 @@ def _log(msg, level=Qgis.MessageLevel.Info):
     QgsMessageLog.logMessage(str(msg), "Paladin", level)
 
 
+# Sentinel so update_attributes() can tell "leave unchanged" from "clear to None".
+_UNSET = object()
+
+
 def utc_now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -302,6 +306,53 @@ class TacticStore:
     def mark_inactive(self, tactic_id):
         """Soft-delete: flag for a tombstone version on next sync."""
         return self._set_attrs(tactic_id, {"status": config.STATUS_INACTIVE})
+
+    def update_attributes(self, tactic_id, *, visibility=None, simulate=None,
+                          notes=None, effective_from=None, effective_to=None,
+                          line_width_m=_UNSET):
+        """Edit metadata on an existing tactic (drawn OR imported).
+
+        Only the arguments you pass are changed. These fields are part of the
+        content hash, so an edit here makes the next Sync record a new version
+        in the same lineage — no delete-and-recreate needed. Geometry is edited
+        separately via the Vertex Tool.
+
+        `line_width_m` only applies to line features; pass a float to set it,
+        None to clear it, or leave it unset to keep the current value. Setting a
+        width on a polygon feature is ignored.
+        """
+        layer, feat = self._find(tactic_id)
+        if feat is None:
+            return False
+        attrs = {}
+        if visibility is not None:
+            if visibility not in config.VISIBILITY_LEVELS:
+                _log("Refusing invalid visibility %r" % visibility,
+                     Qgis.MessageLevel.Warning)
+                return False
+            attrs["visibility"] = visibility
+        if simulate is not None:
+            attrs["simulate"] = "true" if simulate else "false"
+        if notes is not None:
+            attrs["notes"] = notes
+        if effective_from is not None:
+            attrs["effective_from_utc"] = effective_from
+        if effective_to is not None:
+            attrs["effective_to_utc"] = effective_to
+        if line_width_m is not _UNSET:
+            is_line = layer.geometryType() == Qgis.GeometryType.Line
+            if is_line:
+                if line_width_m in (None, ""):
+                    attrs["line_width_m"] = None
+                else:
+                    try:
+                        attrs["line_width_m"] = float(line_width_m)
+                    except (TypeError, ValueError):
+                        _log("Ignoring non-numeric width %r" % line_width_m,
+                             Qgis.MessageLevel.Warning)
+        if not attrs:
+            return False
+        return self._set_attrs(tactic_id, attrs)
 
     def current_versions(self):
         """{tactic_id: version_int} for everything we currently hold synced."""

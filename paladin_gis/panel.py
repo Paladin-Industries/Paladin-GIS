@@ -27,8 +27,11 @@ from qgis.core import (
 from qgis.PyQt.QtCore import Qt, QThread, pyqtSignal
 from qgis.PyQt.QtWidgets import (
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDockWidget,
     QFileDialog,
+    QFormLayout,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -99,6 +102,77 @@ def save_settings(values):
 
 
 # --------------------------------------------------------------------------- #
+# Properties editor  (change metadata on an existing tactic, drawn or imported)
+# --------------------------------------------------------------------------- #
+class _PropertiesDialog(QDialog):
+    """Edit visibility, simulate, notes, effective window, and (for lines) width
+    on an existing tactic. Pre-filled from the feature's current attributes."""
+
+    def __init__(self, parent, feat, is_line):
+        super().__init__(parent)
+        self.setWindowTitle("Tactic properties")
+        self._is_line = is_line
+        form = QFormLayout(self)
+
+        self._visibility = QComboBox()
+        for level in config.VISIBILITY_LEVELS:
+            self._visibility.addItem(level, level)
+        cur_vis = feat["visibility"] or config.DEFAULT_VISIBILITY
+        self._visibility.setCurrentText(cur_vis)
+        form.addRow("Visibility:", self._visibility)
+
+        self._simulate = QCheckBox("Include in simulations")
+        self._simulate.setChecked((feat["simulate"] or "true") == "true")
+        form.addRow("", self._simulate)
+
+        self._width = QLineEdit()
+        if is_line:
+            w = feat["line_width_m"]
+            self._width.setText("" if w in (None, "") else str(w))
+            self._width.setPlaceholderText("metres")
+            form.addRow("Line width (m):", self._width)
+
+        self._notes = QLineEdit(feat["notes"] or "")
+        form.addRow("Notes:", self._notes)
+
+        self._eff_from = QLineEdit(feat["effective_from_utc"] or "")
+        self._eff_from.setPlaceholderText("Effective from UTC (blank = now)")
+        form.addRow("From:", self._eff_from)
+
+        self._eff_to = QLineEdit(feat["effective_to_utc"] or "")
+        self._eff_to.setPlaceholderText("Effective to UTC (blank = open)")
+        form.addRow("To:", self._eff_to)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def values(self):
+        """Return the edited values. `line_width_m` is tactics._UNSET for polygon
+        features (leave unchanged); for lines it's a float, or None to clear."""
+        width = tactics._UNSET
+        if self._is_line:
+            raw = self._width.text().strip().replace(",", ".")
+            if not raw:
+                width = None
+            else:
+                try:
+                    width = float(raw)
+                except ValueError:
+                    width = tactics._UNSET  # unparseable -> don't touch it
+        return {
+            "visibility": self._visibility.currentData(),
+            "simulate": self._simulate.isChecked(),
+            "notes": self._notes.text().strip(),
+            "effective_from": self._eff_from.text().strip(),
+            "effective_to": self._eff_to.text().strip(),
+            "line_width_m": width,
+        }
+
+
+# --------------------------------------------------------------------------- #
 # Sync worker  (network I/O only; no QGIS layer creation off the main thread)
 # --------------------------------------------------------------------------- #
 class SyncWorker(QThread):
@@ -118,8 +192,15 @@ class SyncWorker(QThread):
         self._my_author = my_author
 
     def _visible_to_me(self, props):
-        """Honor per-file visibility (client-side; the broker enforces for real)."""
-        vis = (props.get("visibility") or "org").lower()
+        """Honor per-file visibility (client-side; the broker enforces for real).
+
+        Fail closed: an object with no/blank visibility is treated as private,
+        so an unlabeled tactic is never shown to anyone but its author. This is
+        display-only — see the note in Sync: the object bytes are still readable
+        by anyone holding the shared credentials until server-side enforcement
+        lands.
+        """
+        vis = (props.get("visibility") or "private").lower()
         if vis == "public":
             return True
         if vis == "org":
@@ -450,6 +531,18 @@ class PaladinDock(QDockWidget):
         row.addWidget(self._import_type)
         lay.addLayout(row)
 
+        # Imports get their OWN visibility control (not the draw group's), so the
+        # choice is explicit at import time and defaults to the safe level.
+        vis_row = QHBoxLayout()
+        vis_row.addWidget(QLabel("Visibility:"))
+        self._import_visibility = QComboBox()
+        for level in config.VISIBILITY_LEVELS:
+            self._import_visibility.addItem(level, level)
+        self._import_visibility.setCurrentText(config.DEFAULT_VISIBILITY)
+        vis_row.addWidget(self._import_visibility)
+        vis_row.addStretch(1)
+        lay.addLayout(vis_row)
+
         btn = QPushButton("Import GeoJSON / KML / KMZ...")
         btn.clicked.connect(self._on_import)
         lay.addWidget(btn)
@@ -466,9 +559,11 @@ class PaladinDock(QDockWidget):
         n = layers.import_tactics_from_file(
             path, tactic_type, self._store,
             org_id=s.get("org_id", ""), author=s.get("author", ""),
-            visibility=self._visibility.currentData(),
+            visibility=self._import_visibility.currentData(),
             simulate=self._simulate.isChecked())
-        self._iface.messageBar().pushInfo("Paladin", "Imported %d feature(s)" % n)
+        self._iface.messageBar().pushInfo(
+            "Paladin", "Imported %d feature(s) as %s"
+            % (n, self._import_visibility.currentData()))
         self.refresh_list()
 
     # ---- Tactic list ------------------------------------------------------- #
@@ -481,15 +576,17 @@ class PaladinDock(QDockWidget):
         lay.addWidget(self._list)
 
         row = QHBoxLayout()
-        self._edit_btn = QPushButton("Edit")
+        self._edit_btn = QPushButton("Edit shape")
         self._edit_btn.clicked.connect(self._toggle_edit)
+        props = QPushButton("Properties...")
+        props.clicked.connect(self._edit_properties)
         zoom = QPushButton("Zoom")
         zoom.clicked.connect(self._zoom_selected)
         remove = QPushButton("Delete")
         remove.clicked.connect(self._delete_selected)
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(self.refresh_list)
-        for b in (self._edit_btn, zoom, remove, refresh):
+        for b in (self._edit_btn, props, zoom, remove, refresh):
             row.addWidget(b)
         lay.addLayout(row)
         return box
@@ -535,6 +632,40 @@ class PaladinDock(QDockWidget):
             self.refresh_list()
             self._iface.messageBar().pushInfo(
                 "Paladin", "Saved. Sync to record the new version.")
+
+    def _edit_properties(self):
+        """Edit metadata (visibility, width, notes, simulate, effective window)
+        on the selected tactic — works for drawn and imported tactics alike.
+        Saving bumps a new version on the next Sync (no delete-and-recreate)."""
+        tactic_id = self._selected_tactic_id()
+        if not tactic_id:
+            self._iface.messageBar().pushInfo(
+                "Paladin", "Select a tactic in the list first.")
+            return
+        layer, feat = self._store._find(tactic_id)
+        if feat is None:
+            return
+        is_line = layer.geometryType() == Qgis.GeometryType.Line
+        dlg = _PropertiesDialog(self, feat, is_line)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        vals = dlg.values()
+        ok = self._store.update_attributes(
+            tactic_id,
+            visibility=vals["visibility"],
+            simulate=vals["simulate"],
+            notes=vals["notes"],
+            effective_from=vals["effective_from"],
+            effective_to=vals["effective_to"],
+            line_width_m=vals["line_width_m"],
+        )
+        if ok:
+            self.refresh_list()
+            self._iface.messageBar().pushInfo(
+                "Paladin", "Updated properties. Sync to record the new version.")
+        else:
+            self._iface.messageBar().pushWarning(
+                "Paladin", "Could not update properties (see the Log).")
 
     def refresh_list(self):
         self._list.clear()
