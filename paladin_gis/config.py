@@ -222,5 +222,11 @@ DEFAULT_DISTURBANCE_PREFIX = "disturbances"
 # Identity defaults (set per user in Settings).
 DEFAULT_ORG_ID = ""
 
+# Paladin account login endpoint (mcleod / paradise). The plugin POSTs
+# email+password to {AUTH_ENDPOINT}/login and gets identity + license tier back.
+# Empty by default; set it in Settings. For local backend testing use e.g.
+# http://localhost:3000/gis/auth
+DEFAULT_AUTH_ENDPOINT = ""
+
 # QgsSettings group under which all overridable values are stored.
 SETTINGS_GROUP = "paladin_gis"

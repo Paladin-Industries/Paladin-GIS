@@ -41,6 +41,8 @@ import urllib.request
 
 from qgis.core import Qgis, QgsMessageLog
 
+from . import config, paladin_auth
+
 
 def _log(msg, level=Qgis.MessageLevel.Info):
     QgsMessageLog.logMessage(str(msg), "Paladin", level)
@@ -272,21 +274,118 @@ class Boto3Backend:
 # --------------------------------------------------------------------------- #
 # Factory
 # --------------------------------------------------------------------------- #
+class McleodBackend:
+    """Sync through the mcleod public API (JWT-gated, keyless).
+
+    Same put/list/get interface as the S3 backends, so SyncWorker is unchanged.
+    mcleod owns the S3 keys, stamps author/org from the verified token on write,
+    and enforces visibility on read — so a `get` of an object you're not allowed
+    to see returns 403, which we treat as "skip", not a fatal sync error.
+
+    One URL to configure: the broker base is derived from the auth endpoint
+    (`.../gis/auth` -> `.../gis/disturbances`).
+    """
+
+    def __init__(self, auth_endpoint, token, refresh_token="", email=""):
+        self._auth_endpoint = auth_endpoint.rstrip("/")
+        base = self._auth_endpoint
+        if base.endswith("/gis/auth"):
+            base = base[: -len("/auth")] + "/disturbances"
+        else:
+            base = base + "/disturbances"
+        self._base = base
+        self._token = token
+        self._refresh = refresh_token
+        self._email = email
+
+    def _headers(self, extra=None):
+        h = {"Authorization": "Bearer %s" % self._token}
+        if extra:
+            h.update(extra)
+        return h
+
+    @staticmethod
+    def _expired():
+        return SyncError("Session expired - sign in again in the Paladin Account panel.")
+
+    def _refresh_access(self):
+        """Trade the stored refresh token for a fresh access token, persist it,
+        and return True on success. Called automatically on a 401."""
+        if not self._refresh or not self._email:
+            return False
+        try:
+            res = paladin_auth.refresh(self._auth_endpoint, self._refresh, self._email)
+        except paladin_auth.AuthError:
+            return False
+        tok = res.get("token", "")
+        if not tok:
+            return False
+        self._token = tok
+        self._refresh = res.get("refresh_token", self._refresh)
+        try:  # persist so the next session/sync starts with the fresh token
+            from qgis.core import QgsSettings
+            st = QgsSettings()
+            st.beginGroup(config.SETTINGS_GROUP)
+            st.setValue("token", self._token)
+            st.setValue("refresh_token", self._refresh)
+            st.endGroup()
+        except Exception:
+            pass
+        return True
+
+    def _send(self, method, url, body=None, _retried=False):
+        """One request with the bearer token. On 401, refresh once and retry;
+        if that still 401s, raise 'session expired'. Other HTTP errors are
+        re-raised for the caller to interpret (403/404/409)."""
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        extra = {"Content-Type": "application/json"} if body is not None else None
+        req = urllib.request.Request(url, data=data, headers=self._headers(extra),
+                                     method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                raw = resp.read()
+                return json.loads(raw) if raw else None
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                if not _retried and self._refresh_access():
+                    return self._send(method, url, body, _retried=True)
+                raise self._expired()
+            raise
+        except urllib.error.URLError as exc:
+            raise SyncError("%s failed: %s" % (method, exc))
+
+    def list_keys(self, prefix):
+        url = self._base + "/list?" + urllib.parse.urlencode({"prefix": prefix})
+        try:
+            return (self._send("GET", url) or {}).get("keys", [])
+        except urllib.error.HTTPError as exc:
+            raise SyncError("list failed: HTTP %s" % exc.code)
+
+    def get_geojson(self, key):
+        url = self._base + "/get?" + urllib.parse.urlencode({"key": key})
+        try:
+            return self._send("GET", url)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (403, 404):
+                return None            # not visible / gone -> skip
+            raise SyncError("get %s failed: HTTP %s" % (key, exc.code))
+
+    def put_geojson(self, key, obj):
+        try:
+            self._send("POST", self._base + "/put", body=obj)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 409:
+                return                 # version already stored (idempotent)
+            raise SyncError("put %s failed: HTTP %s" % (key, exc.code))
+
+
 def make_backend(settings):
-    """Build the configured backend from a settings dict."""
-    backend = settings.get("backend", "s3native")
-    if backend == "boto3":
-        return Boto3Backend(
-            settings["bucket"], settings["region"],
-            access_key=settings.get("access_key", ""),
-            secret_key=settings.get("secret_key", ""),
-            session_token=settings.get("session_token", ""),
-        )
-    if backend == "presigned":
-        return PresignedBackend(settings["api_base"], settings.get("token", ""))
-    return S3NativeBackend(
-        settings["bucket"], settings["region"],
-        access_key=settings.get("access_key", ""),
-        secret_key=settings.get("secret_key", ""),
-        session_token=settings.get("session_token", ""),
-    )
+    """Build the sync backend. All sync now goes through the mcleod broker,
+    keyless — the plugin holds only the login endpoint + a token. Signing in is
+    required; there is no direct-S3 path anymore (no AWS keys on the client)."""
+    if settings.get("auth_endpoint") and settings.get("token"):
+        return McleodBackend(
+            settings["auth_endpoint"], settings["token"],
+            settings.get("refresh_token", ""), settings.get("email", ""))
+    raise SyncError(
+        "Sign in to your Paladin account (Paladin Account panel) before syncing.")

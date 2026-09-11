@@ -49,7 +49,7 @@ from qgis.PyQt.QtWidgets import (
     QWidget,
 )
 
-from . import config, landfire_catalog, layers, s3_client, tactics
+from . import config, landfire_catalog, layers, paladin_auth, s3_client, tactics
 
 
 def _log(msg, level=Qgis.MessageLevel.Info):
@@ -88,6 +88,11 @@ def load_settings():
         "session_token": s.value("session_token", config.DEFAULT_SESSION_TOKEN, str),
         "disturbance_prefix": s.value("disturbance_prefix",
                                       config.DEFAULT_DISTURBANCE_PREFIX, str),
+        # Paladin account login (identity comes from here once signed in).
+        "auth_endpoint": s.value("auth_endpoint", config.DEFAULT_AUTH_ENDPOINT, str),
+        "email": s.value("email", "", str),
+        "refresh_token": s.value("refresh_token", "", str),
+        "tier": s.value("tier", "", str),
     }
     s.endGroup()
     return out
@@ -173,6 +178,27 @@ class _PropertiesDialog(QDialog):
 
 
 # --------------------------------------------------------------------------- #
+# Login worker  (auth network call off the UI thread)
+# --------------------------------------------------------------------------- #
+class LoginWorker(QThread):
+    done = pyqtSignal(dict)              # session dict on success
+    failed = pyqtSignal(int, str, str)  # (status, code, message)
+
+    def __init__(self, endpoint, email, password):
+        super().__init__()
+        self._endpoint = endpoint
+        self._email = email
+        self._password = password
+
+    def run(self):
+        try:
+            res = paladin_auth.login(self._endpoint, self._email, self._password)
+            self.done.emit(res)
+        except paladin_auth.AuthError as err:
+            self.failed.emit(err.status, err.code, err.message)
+
+
+# --------------------------------------------------------------------------- #
 # Sync worker  (network I/O only; no QGIS layer creation off the main thread)
 # --------------------------------------------------------------------------- #
 class SyncWorker(QThread):
@@ -233,6 +259,8 @@ class SyncWorker(QThread):
                 if have_ver is not None and ver <= have_ver:
                     continue  # we already hold this version (or newer)
                 obj = backend.get_geojson(key)
+                if obj is None:
+                    continue  # broker refused (not visible) or gone -> skip
                 props = _first_props(obj)
                 if not self._visible_to_me(props):
                     continue
@@ -290,6 +318,7 @@ class PaladinDock(QDockWidget):
         self._editing_lineage = None
         self._editing_layer = None
         self._pending_removals = []
+        self._login_worker = None
         self.setObjectName("PaladinDock")
 
         container = QWidget()
@@ -299,6 +328,7 @@ class PaladinDock(QDockWidget):
         self.setWidget(scroll)
 
         root = QVBoxLayout(container)
+        root.addWidget(self._build_account_group())
         root.addWidget(self._build_landfire_group())
         root.addWidget(self._build_draw_group())
         root.addWidget(self._build_import_group())
@@ -308,6 +338,7 @@ class PaladinDock(QDockWidget):
         root.addStretch(1)
 
         self.refresh_list()
+        self._refresh_login_status()
 
     def set_capture_tool(self, tool):
         self._capture_tool = tool
@@ -737,6 +768,116 @@ class PaladinDock(QDockWidget):
                 "Paladin", "Marked inactive. Sync to record the deletion.")
         self.refresh_list()
 
+    # ---- Paladin account / login ------------------------------------------ #
+    def _build_account_group(self):
+        box = QGroupBox("Paladin Account")
+        lay = QGridLayout(box)
+        s = load_settings()
+
+        self._set_endpoint = QLineEdit(s["auth_endpoint"])
+        self._set_endpoint.setPlaceholderText(
+            "https://api.paladinindustries.com/gis/auth  (or http://localhost:3000/gis/auth)")
+        self._set_email = QLineEdit(s["email"])
+        self._set_email.setPlaceholderText("you@department.gov")
+        self._login_pw = QLineEdit()
+        self._login_pw.setEchoMode(QLineEdit.EchoMode.Password)
+        self._login_pw.setPlaceholderText("Paladin password (not stored)")
+
+        lay.addWidget(QLabel("Login endpoint"), 0, 0)
+        lay.addWidget(self._set_endpoint, 0, 1)
+        lay.addWidget(QLabel("Email"), 1, 0)
+        lay.addWidget(self._set_email, 1, 1)
+        lay.addWidget(QLabel("Password"), 2, 0)
+        lay.addWidget(self._login_pw, 2, 1)
+
+        self._login_btn = QPushButton("Login")
+        self._login_btn.clicked.connect(self._on_login)
+        self._logout_btn = QPushButton("Sign out")
+        self._logout_btn.clicked.connect(self._on_logout)
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(self._login_btn)
+        btn_row.addWidget(self._logout_btn)
+        lay.addLayout(btn_row, 3, 0, 1, 2)
+
+        self._login_status = QLabel("")
+        self._login_status.setWordWrap(True)
+        lay.addWidget(self._login_status, 4, 0, 1, 2)
+        return box
+
+    def _is_logged_in(self):
+        # The server only returns a refresh token when auth AND the license-tier
+        # check both pass, so holding one means "signed in and licensed".
+        return bool(load_settings().get("refresh_token", "").strip())
+
+    def _login_required(self):
+        # Gate only when an endpoint is configured; a deployment still on emailed
+        # AWS keys (no endpoint) keeps working until it switches to login.
+        return bool(load_settings().get("auth_endpoint", "").strip())
+
+    def _on_login(self):
+        endpoint = self._set_endpoint.text().strip()
+        email = self._set_email.text().strip()
+        password = self._login_pw.text()
+        if not endpoint or not email or not password:
+            self._login_status.setText(
+                "Enter the login endpoint, your email, and your password.")
+            return
+        # Persist endpoint + email now (not the password) so a retry is quick.
+        save_settings({"auth_endpoint": endpoint, "email": email})
+        self._login_btn.setEnabled(False)
+        self._login_status.setText("Signing in...")
+        self._login_worker = LoginWorker(endpoint, email, password)
+        self._login_worker.done.connect(self._on_login_ok)
+        self._login_worker.failed.connect(self._on_login_failed)
+        self._login_worker.start()
+
+    def _on_login_ok(self, res):
+        self._login_pw.clear()  # never keep the password around
+        self._login_btn.setEnabled(True)
+        # Identity now comes from Cognito, not typed. Store the refresh token
+        # (revocable) instead of the password.
+        save_settings({
+            "author": res.get("author", ""),
+            "org_id": res.get("org_id", ""),
+            "tier": res.get("tier", ""),
+            "token": res.get("token", ""),
+            "refresh_token": res.get("refresh_token", ""),
+            "email": res.get("email", self._set_email.text().strip()),
+        })
+        self._refresh_login_status()
+        self._iface.messageBar().pushInfo(
+            "Paladin", "Signed in as %s (tier: %s)"
+            % (res.get("email", ""), res.get("tier", "?")))
+
+    def _on_login_failed(self, status, code, message):
+        self._login_btn.setEnabled(True)
+        if code == "tier_insufficient" or status == 403:
+            self._login_status.setText(
+                "Your account isn't licensed for the GIS tool. "
+                "Contact sales for a GIS upgrade: sales@paladinindustries.com")
+        else:
+            self._login_status.setText(message or "Login failed.")
+
+    def _on_logout(self):
+        save_settings({"refresh_token": "", "token": "", "tier": ""})
+        self._refresh_login_status()
+
+    def _refresh_login_status(self):
+        s = load_settings()
+        gated = self._login_required()
+        if self._is_logged_in():
+            self._login_status.setText(
+                "Signed in as %s — tier: %s"
+                % (s.get("email", ""), s.get("tier", "") or "?"))
+        elif gated:
+            self._login_status.setText("Not signed in. Log in to sync with Paladin.")
+        else:
+            self._login_status.setText(
+                "No login endpoint set (using emailed AWS keys).")
+        # Gate Sync: if an endpoint is configured, require a session.
+        if hasattr(self, "_sync_btn"):
+            self._sync_btn.setEnabled(self._is_logged_in() or not gated)
+
     # ---- Sync -------------------------------------------------------------- #
     def _build_sync_group(self):
         box = QGroupBox("Sync")
@@ -751,6 +892,12 @@ class PaladinDock(QDockWidget):
 
     def _on_sync(self):
         s = load_settings()
+        if self._login_required() and not self._is_logged_in():
+            QMessageBox.warning(
+                self, "Paladin",
+                "Log in to your Paladin account (in the Paladin Account panel) "
+                "before syncing.")
+            return
         author = s.get("author", "").strip()
         if not author:
             QMessageBox.warning(self, "Paladin",
@@ -771,16 +918,10 @@ class PaladinDock(QDockWidget):
             chash = tactics.content_hash(feat)
             status = feat["status"] or config.STATUS_ACTIVE
 
-            if status == config.STATUS_INACTIVE:
-                if state is None:
-                    continue  # deleted before ever syncing -> nothing in S3
-                version, op = state["version"] + 1, "delete"
-            elif state is None:
-                version, op = 1, "create"
-            elif chash != state["hash"]:
-                version, op = state["version"] + 1, "edit"
-            else:
-                continue  # unchanged since last sync
+            plan = tactics.plan_version(state, status, chash)
+            if plan is None:
+                continue
+            version, op = plan
 
             version_id = str(uuid.uuid4())
             supersedes = state["version_id"] if state else ""
@@ -841,46 +982,29 @@ class PaladinDock(QDockWidget):
 
     # ---- Settings ---------------------------------------------------------- #
     def _build_settings_group(self):
-        box = QGroupBox("Settings")
+        box = QGroupBox("Identity")
         lay = QGridLayout(box)
         s = load_settings()
 
-        # Only per-user values are exposed. Bucket, region, prefix, backend,
-        # session token, and API base/token are fixed defaults in config.py --
-        # one bucket, one region, one prefix, boto3 -- so customers don't touch
-        # them. The individual credentials you email are the only S3 inputs.
+        # Identity now comes from your Paladin login (Cognito). These are shown
+        # read-only so you can see what mcleod stamps on your tactics; there are
+        # no AWS keys to enter anymore — sync is keyless, through mcleod.
         self._set_author = QLineEdit(s["author"])
+        self._set_author.setReadOnly(True)
         self._set_org = QLineEdit(s["org_id"])
-        self._set_akey = QLineEdit(s["access_key"])
-        self._set_skey = QLineEdit(s["secret_key"])
-        self._set_skey.setEchoMode(QLineEdit.EchoMode.Password)
+        self._set_org.setReadOnly(True)
 
         rows = [
-            ("Author / user id", self._set_author),
+            ("Author (Cognito sub)", self._set_author),
             ("Org id", self._set_org),
-            ("AWS Access Key ID", self._set_akey),
-            ("AWS Secret Access Key", self._set_skey),
         ]
         for i, (label, widget) in enumerate(rows):
             lay.addWidget(QLabel(label), i, 0)
             lay.addWidget(widget, i, 1)
 
-        hint = QLabel("Author = you (individual, for private tactics). Org id = "
-                      "your organization (controls 'org' visibility). Paste the "
-                      "two AWS keys you were emailed.")
+        hint = QLabel("Set by signing in above. Author identifies you (private "
+                      "tactics); Org id controls 'org' visibility. Sync goes "
+                      "through Paladin - no AWS keys needed.")
         hint.setWordWrap(True)
         lay.addWidget(hint, len(rows), 0, 1, 2)
-
-        save = QPushButton("Save settings")
-        save.clicked.connect(self._save_settings)
-        lay.addWidget(save, len(rows) + 1, 0, 1, 2)
         return box
-
-    def _save_settings(self):
-        save_settings({
-            "author": self._set_author.text().strip(),
-            "org_id": self._set_org.text().strip(),
-            "access_key": self._set_akey.text().strip(),
-            "secret_key": self._set_skey.text().strip(),
-        })
-        self._iface.messageBar().pushInfo("Paladin", "Settings saved.")
