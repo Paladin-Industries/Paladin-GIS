@@ -87,6 +87,30 @@ def _log(msg, level=Qgis.MessageLevel.Info):
 _UNSET = object()
 
 
+def plan_version(state, status, content_hash):
+    """Decide the next sync op for one tactic. Pure -> unit-testable.
+
+    `state` is the last synced state ({"version", "version_id", "hash"}) or None
+    if never synced. Returns (version:int, op:str) with op in
+    {"create","edit","delete"}, or None to skip (unchanged, or a delete of
+    something never synced).
+
+    The delete branch is why `state` must survive reloads (it's persisted): if a
+    reload dropped it to None, an inactive tactic would return None here and the
+    tombstone would never be written — the #5 "delete does nothing" bug.
+    """
+    inactive = status == config.STATUS_INACTIVE
+    if inactive:
+        if state is None:
+            return None                       # deleted before ever syncing
+        return state["version"] + 1, "delete"
+    if state is None:
+        return 1, "create"
+    if content_hash != state["hash"]:
+        return state["version"] + 1, "edit"
+    return None                               # unchanged since last sync
+
+
 def utc_now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -125,8 +149,35 @@ class TacticStore:
         self._area_layer = None
         self._line_layer = None
         # tactic_id -> {"version": int, "version_id": str, "hash": str}
-        # Local bookkeeping (session-scoped) for change detection on sync.
-        self._sync_state = {}
+        # Change-detection bookkeeping for sync. Persisted to QgsSettings so it
+        # survives QGIS/plugin reloads — otherwise a reload loses every tactic's
+        # synced version, which makes a post-reload delete get skipped (its state
+        # reads as None before the read-down restores it) and causes duplicate
+        # version writes to the append-only store.
+        self._sync_state = self._load_sync_state()
+
+    _SYNC_STATE_KEY = "sync_state_json"
+
+    def _load_sync_state(self):
+        from qgis.core import QgsSettings
+        s = QgsSettings()
+        raw = s.value("%s/%s" % (config.SETTINGS_GROUP, self._SYNC_STATE_KEY), "", str)
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else {}
+        except (ValueError, TypeError):
+            return {}
+
+    def _save_sync_state(self):
+        from qgis.core import QgsSettings
+        s = QgsSettings()
+        try:
+            s.setValue("%s/%s" % (config.SETTINGS_GROUP, self._SYNC_STATE_KEY),
+                       json.dumps(self._sync_state))
+        except (TypeError, ValueError):
+            pass
 
     # -- layer lifecycle ---------------------------------------------------- #
     def _ensure_layer(self, geom_kind):
@@ -258,6 +309,7 @@ class TacticStore:
                 layer.dataProvider().deleteFeatures(ids)
                 layer.triggerRepaint()
                 self._sync_state.pop(tactic_id, None)
+                self._save_sync_state()
                 return True
         return False
 
@@ -273,6 +325,7 @@ class TacticStore:
         self._sync_state[tactic_id] = {
             "version": int(version), "version_id": version_id,
             "hash": content_hash}
+        self._save_sync_state()
 
     def _find(self, tactic_id):
         for layer in self.layers():
