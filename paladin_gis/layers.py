@@ -123,19 +123,33 @@ def import_tactics_from_file(path, tactic_type, store, *, org_id="", author="",
     if layer is None:
         return 0
 
-    added = 0
+    added = skipped = 0
     fname = os.path.basename(path)
     for feat in layer.getFeatures():
         geom = feat.geometry()
         if geom is None or geom.isEmpty():
             continue
+        # 0.3.0 used the tactic TYPE's default geometry, so a polygon imported
+        # as "Dozer Line" was pushed into the line layer. Follow the data.
+        gtype = geom.type()
+        if gtype == Qgis.GeometryType.Polygon:
+            mode, width = "area", None
+        elif gtype == Qgis.GeometryType.Line:
+            mode, width = "line", config.DEFAULT_LINE_WIDTH_M
+        else:
+            skipped += 1        # points / unknown: not a tactic shape
+            continue
         tid = store.add_tactic(
             tactic_type, geom, src_crs,
             org_id=org_id, author=author, visibility=visibility,
             simulate=simulate, source="imported", source_file=fname,
+            geometry_mode=mode, line_width_m=width,
         )
         if tid:
             added += 1
+    if skipped:
+        _log("Skipped %d point/unsupported feature(s) in %s" % (skipped, fname),
+             Qgis.MessageLevel.Warning)
     _log("Imported %d tactic(s) from %s as %s" % (added, fname, tactic_type))
     return added
 

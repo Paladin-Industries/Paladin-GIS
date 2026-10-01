@@ -299,7 +299,8 @@ class McleodBackend:
         self._email = email
 
     def _headers(self, extra=None):
-        h = {"Authorization": "Bearer %s" % self._token}
+        h = {"Authorization": "Bearer %s" % self._token,
+             "User-Agent": config.USER_AGENT}
         if extra:
             h.update(extra)
         return h
@@ -371,11 +372,15 @@ class McleodBackend:
             raise SyncError("get %s failed: HTTP %s" % (key, exc.code))
 
     def put_geojson(self, key, obj):
+        """True = stored. False = HTTP 409: that version number was taken by a
+        concurrent writer. 0.3.0 swallowed 409 as success, which silently lost
+        the edit; the caller now leaves the tactic unsynced for the next run."""
         try:
             self._send("POST", self._base + "/put", body=obj)
+            return True
         except urllib.error.HTTPError as exc:
             if exc.code == 409:
-                return                 # version already stored (idempotent)
+                return False
             raise SyncError("put %s failed: HTTP %s" % (key, exc.code))
 
 

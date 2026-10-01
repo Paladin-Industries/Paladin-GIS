@@ -441,7 +441,8 @@ class TacticStore:
             return "skipped"
 
         geom = _payload_geometry(geom_json)
-        if geom is None:
+        if geom is None or geom.type() not in (Qgis.GeometryType.Polygon,
+                                               Qgis.GeometryType.Line):
             return "skipped"
 
         if feat is None:

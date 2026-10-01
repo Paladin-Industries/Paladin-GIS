@@ -14,8 +14,6 @@
 # License along with this program; if not, see <https://www.gnu.org/licenses/>.
 """The Paladin dock panel and its sync worker."""
 
-import uuid
-
 from qgis.core import (
     Qgis,
     QgsCoordinateReferenceSystem,
@@ -49,7 +47,7 @@ from qgis.PyQt.QtWidgets import (
     QWidget,
 )
 
-from . import config, landfire_catalog, layers, paladin_auth, s3_client, tactics
+from . import config, landfire_catalog, layers, paladin_auth, s3_client, sync_plan, tactics
 
 
 def _log(msg, level=Qgis.MessageLevel.Info):
@@ -202,30 +200,37 @@ class LoginWorker(QThread):
 # Sync worker  (network I/O only; no QGIS layer creation off the main thread)
 # --------------------------------------------------------------------------- #
 class SyncWorker(QThread):
+    """List -> push -> pull. Network only; QGIS layer edits happen on the main
+    thread via the queued `uploaded` / `downloaded` signals.
+
+    0.3.1 fixes:
+      * Lists remote FIRST and uploads at max(local, remote)+1, so editing a
+        lineage someone else bumped no longer reuses their version number.
+      * Version fields + sync state are committed (on the main thread) only
+        after each upload succeeds - a mid-sync failure no longer marks unsent
+        edits as synced.
+      * HTTP 409 (version taken by a concurrent writer) leaves the tactic
+        unsynced for the next run instead of being swallowed as success.
+    """
     progress = pyqtSignal(str)
+    uploaded = pyqtSignal(object)          # dict: lineage, op, version, ...
+    conflict = pyqtSignal(str)             # label of a tactic left unsynced
     downloaded = pyqtSignal(object)        # current-version geojson payload
-    finished_ok = pyqtSignal(int, int)     # (uploaded, downloaded)
+    finished_ok = pyqtSignal(int, int, int)  # (uploaded, downloaded, retry)
     failed = pyqtSignal(str)
 
-    def __init__(self, settings, uploads, list_prefix, have=None,
+    def __init__(self, settings, pending, list_prefix, have=None,
                  my_org="", my_author=""):
         super().__init__()
         self._settings = settings
-        self._uploads = uploads            # list of (key, geojson_dict)
-        self._prefix = list_prefix         # shared folder: disturbances/
+        self._pending = pending            # list of dicts built by _on_sync
+        self._prefix = list_prefix         # "disturbances/"
         self._have = dict(have or {})      # lineage -> version we already hold
         self._my_org = my_org
         self._my_author = my_author
 
     def _visible_to_me(self, props):
-        """Honor per-file visibility (client-side; the broker enforces for real).
-
-        Fail closed: an object with no/blank visibility is treated as private,
-        so an unlabeled tactic is never shown to anyone but its author. This is
-        display-only — see the note in Sync: the object bytes are still readable
-        by anyone holding the shared credentials until server-side enforcement
-        lands.
-        """
+        """Client-side visibility, fail closed. mcleod enforces for real."""
         vis = (props.get("visibility") or "private").lower()
         if vis == "public":
             return True
@@ -242,65 +247,58 @@ class SyncWorker(QThread):
             self.failed.emit(str(exc))
             return
 
-        up = 0
+        up = down = retry = 0
+        pushed = set()
         try:
-            for key, obj in self._uploads:
-                self.progress.emit("Uploading %s" % key)
-                backend.put_geojson(key, obj)
+            self.progress.emit("Reading Paladin...")
+            remote = sync_plan.index_remote(self._prefix, backend.list_keys(self._prefix))
+
+            for item in self._pending:
+                lineage = item["lineage"]
+                version, supersedes = sync_plan.resolve_version(
+                    item["hint"], item["state"], remote.get(lineage))
+                vid = sync_plan.new_version_id()
+                created = tactics.utc_now_iso()
+                status = (config.STATUS_INACTIVE if item["op"] == "delete"
+                          else config.STATUS_ACTIVE)
+                obj = sync_plan.stamp(
+                    item["obj"], version=version, version_id=vid,
+                    supersedes=supersedes, created_utc=created,
+                    author=self._my_author, status=status)
+                key = sync_plan.object_key(self._prefix, lineage, version, vid)
+                self.progress.emit("Uploading %s v%d" % (item["label"], version))
+                if backend.put_geojson(key, obj) is False:
+                    retry += 1
+                    self.conflict.emit(item["label"])
+                    continue
                 up += 1
+                pushed.add(lineage)
+                remote[lineage] = {"version": version, "version_id": vid, "key": key}
+                self.uploaded.emit(dict(
+                    lineage=lineage, op=item["op"], version=version, version_id=vid,
+                    supersedes=supersedes, created_utc=created,
+                    author=self._my_author, hash=item["hash"]))
 
             self.progress.emit("Reading down disturbances...")
-            keys = backend.list_keys(self._prefix)
-            current = self._current_version_keys(keys)
-            down = 0
-            for lineage_key, key in current.items():
-                ver = self._version_from_key(key)
-                have_ver = self._have.get(lineage_key)
-                if have_ver is not None and ver <= have_ver:
-                    continue  # we already hold this version (or newer)
-                obj = backend.get_geojson(key)
-                if obj is None:
-                    continue  # broker refused (not visible) or gone -> skip
-                props = _first_props(obj)
-                if not self._visible_to_me(props):
+            for lineage, rem in remote.items():
+                if lineage in pushed:
                     continue
-                # Emit active AND inactive (main thread reconciles: add / update
-                # / remove). Reconciliation and QGIS layer edits run there.
+                have_ver = self._have.get(lineage)
+                if have_ver is not None and rem["version"] <= have_ver:
+                    continue
+                obj = backend.get_geojson(rem["key"])
+                if obj is None:
+                    continue  # broker refused (not visible) or gone
+                if not self._visible_to_me(_first_props(obj)):
+                    continue
                 self.downloaded.emit(obj)
                 down += 1
-                self.progress.emit("Pulled %s v%s" % (lineage_key[:8], ver))
+                self.progress.emit("Pulled %s v%s" % (lineage[:8], rem["version"]))
         except s3_client.SyncError as exc:
             self.failed.emit(str(exc))
             return
 
-        self.finished_ok.emit(up, down)
-
-    @staticmethod
-    def _version_from_key(key):
-        head = key.rsplit("/", 1)[-1].split("-", 1)[0]
-        try:
-            return int(head)
-        except ValueError:
-            return 1  # legacy flat file = single version
-
-    def _current_version_keys(self, keys):
-        """Group object keys by lineage and return {lineage: current_version_key}.
-
-        Layout: {prefix}/{lineage}/{version:06d}-{version_id}.geojson, so the
-        lexically greatest key within a lineage folder is the current version.
-        Flat legacy keys ({prefix}/{id}.geojson) are treated as single-version
-        lineages.
-        """
-        prefix = self._prefix
-        groups = {}
-        for k in keys:
-            rel = k[len(prefix):] if prefix and k.startswith(prefix) else k
-            rel = rel.lstrip("/")
-            lineage_key = rel.split("/", 1)[0] if "/" in rel else rel
-            cur = groups.get(lineage_key)
-            if cur is None or k > cur:
-                groups[lineage_key] = k
-        return groups
+        self.finished_ok.emit(up, down, retry)
 
 
 # --------------------------------------------------------------------------- #
@@ -317,7 +315,7 @@ class PaladinDock(QDockWidget):
         self._worker = None
         self._editing_lineage = None
         self._editing_layer = None
-        self._pending_removals = []
+        self._sync_conflicts = []
         self._login_worker = None
         self.setObjectName("PaladinDock")
 
@@ -658,7 +656,7 @@ class PaladinDock(QDockWidget):
                 layer.removeSelection()
             self._editing_lineage = None
             self._editing_layer = None
-            self._edit_btn.setText("Edit")
+            self._edit_btn.setText("Edit shape")
             self._iface.actionPan().trigger()
             self.refresh_list()
             self._iface.messageBar().pushInfo(
@@ -898,85 +896,80 @@ class PaladinDock(QDockWidget):
                 "Log in to your Paladin account (in the Paladin Account panel) "
                 "before syncing.")
             return
-        author = s.get("author", "").strip()
-        if not author:
+        if not s.get("author", "").strip():
             QMessageBox.warning(self, "Paladin",
-                                "Set an Author / user id in Settings first.")
+                                "Sign in (Paladin Account panel) before syncing.")
             return
 
-        # Build immutable version objects. Never overwrite: create -> v1,
-        # edit -> v+1 (supersedes prev), delete -> v+1 status=inactive.
-        # Key: {prefix}/{tactic_id}/{version:06d}-{version_id}.geojson
+        # Plan only. Version numbers are resolved by the worker AFTER it lists
+        # the remote, and nothing local is stamped until an upload succeeds.
         prefix = s["disturbance_prefix"].strip("/")
-        now = tactics.utc_now_iso()
-        uploads = []
-        self._pending_removals = []   # tombstoned lineages to drop after success
-
+        pending = []
         for _layer, feat in list(self._store.all_tactics()):
             lineage = feat["tactic_id"]
             state = self._store.get_sync_state(lineage)
             chash = tactics.content_hash(feat)
             status = feat["status"] or config.STATUS_ACTIVE
-
             plan = tactics.plan_version(state, status, chash)
             if plan is None:
                 continue
-            version, op = plan
+            hint, op = plan
+            label = config.TACTIC_TYPES.get(feat["tactic_type"], {}).get(
+                "label", feat["tactic_type"])
+            pending.append(dict(
+                lineage=lineage, op=op, hint=hint, hash=chash, label=label,
+                state=dict(state) if state else None,
+                obj={"type": "FeatureCollection",
+                     "features": [tactics.feature_to_geojson(feat)]}))
 
-            version_id = str(uuid.uuid4())
-            supersedes = state["version_id"] if state else ""
-
-            # Stamp version fields onto the feature, then serialize.
-            self._store.set_version_fields(
-                lineage, version_id=version_id, version=version,
-                supersedes=supersedes, status=status, created_utc=now,
-                author=author)
-            _l, feat2 = self._store._find(lineage)
-            payload = tactics.feature_to_geojson(feat2 if feat2 else feat)
-            obj = {"type": "FeatureCollection", "features": [payload]}
-            key = ("%s/%s/%06d-%s.geojson" % (prefix, lineage, version, version_id)
-                   if prefix else
-                   "%s/%06d-%s.geojson" % (lineage, version, version_id))
-            uploads.append((key, obj))
-
-            self._store.set_sync_state(lineage, version, version_id, chash)
-            if op == "delete":
-                self._pending_removals.append(lineage)
-
-        if not uploads:
+        if not pending:
             self._sync_status.setText("No changes to upload. Reading down...")
-
         self._sync_btn.setEnabled(False)
-        have = self._store.current_versions()
+        self._sync_conflicts = []
         self._worker = SyncWorker(
-            s, uploads, (prefix + "/") if prefix else "",
-            have=have,
+            s, pending, (prefix + "/") if prefix else "",
+            have=self._store.current_versions(),
             my_org=s.get("org_id", ""), my_author=s.get("author", ""))
         self._worker.progress.connect(self._sync_status.setText)
+        self._worker.uploaded.connect(self._on_uploaded)
+        self._worker.conflict.connect(self._sync_conflicts.append)
         self._worker.downloaded.connect(self._on_downloaded)
         self._worker.finished_ok.connect(self._on_sync_done)
         self._worker.failed.connect(self._on_sync_failed)
         self._worker.start()
 
+    def _on_uploaded(self, info):
+        # Main thread, one call per CONFIRMED upload.
+        lineage = info["lineage"]
+        if info["op"] == "delete":
+            self._store.remove_tactic(lineage)   # tombstone written; drop locally
+            return
+        self._store.set_version_fields(
+            lineage, version_id=info["version_id"], version=info["version"],
+            supersedes=info["supersedes"], status=config.STATUS_ACTIVE,
+            created_utc=info["created_utc"], author=info["author"])
+        self._store.set_sync_state(lineage, info["version"], info["version_id"],
+                                   info["hash"])
+
     def _on_downloaded(self, obj):
-        # Runs on the main thread (queued signal) -> safe to mutate QGIS layers.
-        # Ingests the tactic into the editable store so it shows in the list and
-        # can be edited; edits continue its lineage on the next sync.
+        # Main thread (queued signal) -> safe to mutate QGIS layers.
         self._store.reconcile_downloaded(obj)
 
-    def _on_sync_done(self, up, down):
+    def _on_sync_done(self, up, down, retry):
         self._sync_btn.setEnabled(True)
-        # Now that the tombstone versions are written, drop the soft-deleted
-        # tactics from the local canvas (their history remains in S3).
-        for lineage in getattr(self, "_pending_removals", []):
-            self._store.remove_tactic(lineage)
-        self._pending_removals = []
         self.refresh_list()
-        self._sync_status.setText("Synced. Uploaded %d, read down %d." % (up, down))
-        self._iface.messageBar().pushSuccess("Paladin", "Sync complete.")
+        msg = "Synced. Uploaded %d, read down %d." % (up, down)
+        if retry:
+            msg += (" %d tactic(s) were saved by someone else at the same moment "
+                    "and stayed unsynced - Sync again." % retry)
+            self._iface.messageBar().pushWarning("Paladin", msg)
+        else:
+            self._iface.messageBar().pushSuccess("Paladin", "Sync complete.")
+        self._sync_status.setText(msg)
 
     def _on_sync_failed(self, msg):
         self._sync_btn.setEnabled(True)
+        self.refresh_list()   # uploads that DID succeed are already recorded
         self._sync_status.setText("Sync failed: %s" % msg)
         self._iface.messageBar().pushWarning("Paladin", "Sync failed. See status.")
 

@@ -1,76 +1,45 @@
-# Paladin GIS — ArcGIS Pro toolbox
+# Paladin for ArcGIS Pro
 
-Python toolbox counterpart to the QGIS plugin. Same store, same versioning, so
-a tactic drawn in Pro shows up in QGIS and back.
+## Install (one time, ~30 seconds)
 
-Windows only — ArcGIS Pro has no macOS build.
+1. Save `PaladinGIS.pyt` anywhere permanent (e.g. `Documents\Paladin`).
+2. In ArcGIS Pro: **Catalog pane → Toolboxes → right-click → Add Toolbox** → pick `PaladinGIS.pyt`.
+3. Right-click the **Paladin** toolbox → **Add To Favorites**, then right-click it under Favorites → **Add To New Projects**. It now appears in every project.
 
-## Layout
+No Python packages, no admin rights, no add-in. Requires ArcGIS Pro 3.x.
 
-    PaladinGIS.pyt     the five geoprocessing tools
-    paladin_core/      wire contract: schema, versioning, geojson, s3, sigv4
-                       (pure stdlib — mirrors the QGIS plugin's config.py,
-                       tactics.py and s3_client.py)
-    paladin_pro/       arcpy-facing: settings, statefile, convert, store, sync
+## Use
 
-`PaladinGIS.pyt` must sit beside both folders.
+1. **Sign In** — email + password, once per computer. The tactic layers appear in your map.
+2. **Draw** — Edit tab → **Create**. Under *Paladin Tactics (Lines)* / *(Areas)* there's a template per tactic (Dozer Line, Handline, Prescribed Burn…). Draw with any Pro tool (trace, freehand, snapping). Edit attributes (Name, Visibility, Include in Simulations, Line Width) in the Attributes pane; delete with Pro's normal Delete.
+3. **Save edits** (Edit tab → Save).
+4. **Sync with Paladin** — uploads your changes, downloads what's shared with you.
 
-## Tools
+Also: **Import Tactics** (a map layer — respects selection — or a GeoJSON/KML/KMZ file) and **Add LANDFIRE Layers**.
 
-1. **Configure Paladin Settings** — author email, org, credentials. The
-   Credentials category renders collapsed; expand it before saving.
-2. **Create Tactic From Features** — stamps drawn features as tactics.
-   Validates geometry type against the tactic (a polygon layer cannot become
-   a dozer line).
-3. **Import Tactics From File** — GeoJSON or shapefile.
-4. **Sync Tactics** — upload + download.
-5. **Pull Tactics** — download only.
+Want a line-drawn fuel break or a polygon-drawn dozer line? Pick that template in the other layer — the geometry is whatever you draw; the tactic type is the template.
 
-## Where things live
+## How it maps to the QGIS plugin
 
-    <project home>\PaladinGIS.gdb\Paladin_Tactics_Area    polygons
-    <project home>\PaladinGIS.gdb\Paladin_Tactics_Line    lines
-    <project home>\paladin_sync_state.json                sync state
-    %APPDATA%\PaladinGIS\settings.json                    settings
+Same wire contract (`paladin.tactic.v3`, Multi* geometries, all-string properties, `{prefix}/{tactic_id}/{version:06d}-{version_id}.geojson`), same mcleod broker and login. Data lives in `<project folder>\Paladin.gdb` (two feature classes with one subtype per tactic type + a sync-state table).
 
-Sync state persisting to disk is a small improvement over the QGIS plugin,
-where it is session-scoped: edits made yesterday still diff correctly today.
+## Bugs fixed relative to QGIS 0.3.0 (also fixed in QGIS 0.3.1)
 
-## Drawing
+1. **Sync marked edits as synced before uploading.** A network failure mid-sync meant those edits were never sent. State is now committed per tactic after the upload succeeds.
+2. **Version-number collisions.** Pushing an edit to a lineage someone else had bumped reused their version number → forked lineage, and mcleod's 409 was swallowed as "success" (edit silently lost). Remote is now listed first; next version = max(local, remote)+1, supersedes the actual current version; a real 409 leaves the tactic unsynced for the next run.
+3. **Import put geometry in the wrong layer.** A polygon imported as "Dozer Line" was forced into the line layer (likely source of the polygon-shaped dozer lines WxPal has to coerce). Geometry kind now follows the data; points are skipped with a warning.
+4. **Legacy flat keys** (`disturbances/{id}.geojson`) were re-downloaded every sync (lineage kept the `.geojson` suffix).
+5. Tokens are DPAPI-encrypted at rest on Windows (QGIS stores them plaintext).
 
-Draw on an ordinary scratch feature class with Pro's editing tools, then run
-tool 2 on the result. **Do not draw directly into the `Paladin_Tactics_*`
-layers** — those are managed by the toolbox, and a hand-drawn row has no
-tactic identity and will confuse sync.
+Pro-specific safety: deleting a synced feature publishes a tombstone, but if ≥3 tactics *and* more than half of everything synced vanish at once, Sync refuses unless *Advanced → Publish large deletions* is checked. Sync state lives inside `Paladin.gdb`, so deleting/replacing the gdb re-downloads instead of deleting everything upstream.
 
-Once a feature is a tactic you can freely edit its shape or attributes in
-place; the next sync picks that up as a new version. To delete, set `status`
-to `inactive` and sync — that writes a tombstone and drops the local row.
+## Engineer first-run checklist (needs a live Pro session)
 
-## Sync semantics
+Sync logic is covered by `test/test_sync.py` against a mock arcpy (create/edit/delete/pull, concurrent edits, mid-sync failure, 409, mass-delete guard, imports incl. KMZ + EPSG:3857). Run: `cd test && python test_sync.py`. Not verifiable without Pro:
 
-Append-only, identical to the QGIS client:
-
-* create → v1, edit → v+1 superseding the previous, delete → v+1 tombstone
-* key layout `{prefix}/{tactic_id}/{version:06d}-{version_id}.geojson`, so the
-  lexically greatest key in a lineage folder is the current version
-* pull filters by visibility (public / your org / your own) and never
-  overwrites local unsynced edits — those are reported as conflicts
-
-## Verified vs. needs a live check
-
-The sync semantics are tested against a mock-arcpy harness: create, no-op on
-unchanged, edit with supersedes, cross-client pull, org visibility filtering,
-tombstone propagation, conflict protection, and the version/key helpers
-(including legacy flat keys). The contract is also checked field-by-field
-against the QGIS plugin's `config.py`.
-
-What cannot be exercised without ArcGIS Pro installed, so check on first run:
-
-* `geometry.__geo_interface__` output and `arcpy.AsShape(dict, False)` input
-* `CreateFeatureclass` + `AddField`, and `da` cursor field ordering with `SHAPE@`
-* the quoted `where_clause` against file-GDB text fields
-* `arcpy.mp.ArcGISProject("CURRENT")` inside a GP tool (fails to a warning)
-
-Symbology is not applied yet — colors exist in `paladin_core.schema.TACTIC_TYPES`
-if you want to add a renderer.
+- [ ] Subtype feature classes show one Create Features template per tactic (if Pro adds them as subtype group layers, that's fine too).
+- [ ] `style_layer` colors apply (best effort — failures are silent, default colors otherwise).
+- [ ] `geom.__geo_interface__` / `arcpy.AsShape` round-trip; a curve drawn with the Arc tool syncs (densified).
+- [ ] Running Sync with unsaved edits gives the "save your edits" message rather than a raw lock error.
+- [ ] `addDataFromPath` for the LANDFIRE ImageServer URLs.
+- [ ] Gate 1 of docs/VALIDATION.md passes against production mcleod.

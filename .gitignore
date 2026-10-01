@@ -23,3 +23,6 @@ settings.local.json
 # OS
 .DS_Store
 Thumbs.db
+
+__pycache__/
+pipeline_validation_*.json

@@ -32,11 +32,20 @@ _FRIENDLY = {
 }
 
 
+def _user_agent():
+    try:
+        from . import config
+        return config.USER_AGENT
+    except Exception:  # noqa: BLE001 - standalone use
+        return "PaladinGIS-QGIS"
+
+
 def _post(url, payload, timeout=20):
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         url, data=data, method="POST",
-        headers={"Content-Type": "application/json", "Accept": "application/json"})
+        headers={"Content-Type": "application/json", "Accept": "application/json",
+                 "User-Agent": _user_agent()})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read().decode("utf-8")
@@ -47,14 +56,20 @@ def _post(url, payload, timeout=20):
             raw = e.read().decode("utf-8", "replace")
         except Exception:
             pass
-        j = {}
+        j, is_json = {}, False
         if raw:
             try:
                 parsed = json.loads(raw)
                 if isinstance(parsed, dict):
-                    j = parsed
+                    j, is_json = parsed, True
             except ValueError:
                 j = {}
+        if not is_json and e.code in (403, 503):
+            # An HTML 403 is Cloudflare/WAF, not the license check.
+            raise AuthError(
+                "The Paladin login service was blocked by network security "
+                "(HTTP %s). Contact support@paladinindustries.com." % e.code,
+                status=e.code, code="blocked")
         raise AuthError(
             j.get("message") or _FRIENDLY.get(e.code, "Login failed (HTTP %s)." % e.code),
             status=e.code, code=j.get("error") or "http_error")

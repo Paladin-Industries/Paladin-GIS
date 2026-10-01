@@ -226,7 +226,12 @@ DEFAULT_ORG_ID = ""
 # email+password to {AUTH_ENDPOINT}/login and gets identity + license tier back.
 # Empty by default; set it in Settings. For local backend testing use e.g.
 # http://localhost:3000/gis/auth
-DEFAULT_AUTH_ENDPOINT = ""
+DEFAULT_AUTH_ENDPOINT = "https://gis.paladinindustries.com/gis/auth"
 
 # QgsSettings group under which all overridable values are stored.
 SETTINGS_GROUP = "paladin_gis"
+
+# Sent on every request. Cloudflare bot rules challenge the default
+# "Python-urllib" agent, which surfaced as a fake "not licensed" 403.
+PLUGIN_VERSION = "0.3.1"
+USER_AGENT = "PaladinGIS-QGIS/%s" % PLUGIN_VERSION
